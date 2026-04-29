@@ -11,10 +11,10 @@ import calibration
 # CHARGEMENT DES MODELES YOLO
 # =========================
 
-model_best2     = YOLO(r"C:/Users/SARA GHERRAS/Desktop/lib/best (2).pt")       # mytruck / fardeaux
-model_best1     = YOLO(r"C:/Users/SARA GHERRAS/Desktop/lib/best (1).pt")       # person
-model_best3     = YOLO(r"C:/Users/SARA GHERRAS/Desktop/lib/best (3) (1).pt")   # cone
-model_best4     = YOLO(r"C:/Users/SARA GHERRAS/Desktop/lib/best (5).pt")       # Box
+model_best2     = YOLO(r"C:/Users/nizar/OneDrive/Bureau/detection/best (2).pt")       # mytruck / fardeaux
+model_best1     = YOLO(r"C:/Users/nizar/OneDrive/Bureau/detection/best (1).pt")       # person
+model_best3     = YOLO(r"C:/Users/nizar/OneDrive/Bureau/detection/best (3).pt")   # cone
+model_best4     = YOLO(r"C:/Users/nizar/OneDrive/Bureau/detection/best (5).pt")       # Box
 model_obstacles = YOLO("yolov8n.pt")                                          # obstacles généraux
 
 FARDEAU_MIN_CONF = 0.04
