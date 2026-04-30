@@ -25,13 +25,13 @@ float current_angle = 0.0f;           // Angle logique courant (degrés)
 #define X_STEP    7
 #define X_DIR     5
 #define X_ENABLE  6
-#define X_FC      53   // Fin de course X (actif LOW)
+#define X_FC      33   // Fin de course X (actif LOW)
 
 // ================== PINS AXE Y ===============================
 #define Y_STEP    8
 #define Y_DIR     9
 #define Y_ENABLE  10
-#define Y_FC      31  // Fin de course Y (actif LOW)
+#define Y_FC      53  // Fin de course Y (actif LOW)
 
 // ================== PINS AXE Z ===============================
 #define Z_STEP    11

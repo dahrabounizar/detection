@@ -44,6 +44,12 @@ import time
 import queue
 import math
 import heapq
+import cv2
+import numpy as np
+from collections import deque
+from ultralytics import YOLO
+import triangulation as tri
+import calibration as cal_module
 
 # ================== CONSTANTES ================================
 WORKSPACE_X = 0.71
@@ -101,6 +107,241 @@ PONT_OUTLINE = '#fbbf24'
 # Journal (sombre pour contraste console)
 LOG_BG = '#1f2937'
 LOG_FG = '#10b981'
+
+# ================== CONSTANTES DÉTECTION ============================
+DET_WINDOW      = 10     # frames dans la fenêtre médiane glissante
+DET_STD_THRESH  = 2.0    # cm — seuil de stabilité (écart-type max)
+DET_MIN_FRAMES  = 5      # détections minimum avant de déclarer stable
+DET_BASE_PATH   = r"C:/Users/nizar/OneDrive/Bureau/detection/"
+
+FARDEAU_MIN_CONF = 0.04
+CONE_MIN_CONF    = 0.10
+TRUCK_ASPECT_MIN = 1.15
+CONE_ASPECT_MAX  = 1.45
+
+# Dimensions par défaut des obstacles détectés (l, w en mètres)
+OBS_DEFAULT_SIZE = {
+    "cone":   (0.10, 0.10),
+    "person": (0.05, 0.05),
+    "box":    (0.15, 0.15),
+}
+
+# Normalisation des noms de classes
+_DET_ALLOWED = {"truck", "mytruck", "fardeau", "fardeaux", "plot", "cone"}
+_DET_MATCH_ALIASES = {
+    "mytruck": "truck", "plot": "cone",
+    "cone": "cone", "fardeau": "fardeaux", "fardeaux": "fardeaux",
+}
+_DET_COEXIST = {frozenset(("truck", "fardeaux"))}
+
+
+def _det_normalize(name):
+    return name.strip().lower()
+
+
+def _det_match_class(name):
+    k = _det_normalize(name)
+    return _DET_MATCH_ALIASES.get(k, k)
+
+
+def _det_valid_shape(match_cls, box):
+    x1, y1, x2, y2 = box
+    ar = max(x2 - x1, 1) / max(y2 - y1, 1)
+    if match_cls == "truck":
+        return ar >= TRUCK_ASPECT_MIN
+    if match_cls == "cone":
+        return ar <= CONE_ASPECT_MAX
+    return True
+
+
+def _det_iou(b1, b2):
+    ix1, iy1 = max(b1[0], b2[0]), max(b1[1], b2[1])
+    ix2, iy2 = min(b1[2], b2[2]), min(b1[3], b2[3])
+    if ix2 < ix1 or iy2 < iy1:
+        return 0.0
+    ia = (ix2 - ix1) * (iy2 - iy1)
+    a1 = (b1[2] - b1[0]) * (b1[3] - b1[1])
+    a2 = (b2[2] - b2[0]) * (b2[3] - b2[1])
+    union = a1 + a2 - ia
+    return ia / union if union > 0 else 0.0
+
+
+def _det_overlap(b1, b2):
+    ix1, iy1 = max(b1[0], b2[0]), max(b1[1], b2[1])
+    ix2, iy2 = min(b1[2], b2[2]), min(b1[3], b2[3])
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0.0
+    ia = (ix2 - ix1) * (iy2 - iy1)
+    a1 = (b1[2] - b1[0]) * (b1[3] - b1[1])
+    a2 = (b2[2] - b2[0]) * (b2[3] - b2[1])
+    mn = min(a1, a2)
+    return ia / mn if mn > 0 else 0.0
+
+
+def _det_filter(dets):
+    if not dets:
+        return dets
+    dets = sorted(dets, key=lambda d: d["conf"], reverse=True)
+    filtered, used = [], set()
+    for i, d in enumerate(dets):
+        if i in used:
+            continue
+        for j in range(i + 1, len(dets)):
+            if j in used:
+                continue
+            o = dets[j]
+            pair = frozenset((d["match_cls"], o["match_cls"]))
+            if pair not in _DET_COEXIST and (
+                _det_iou(d["box"], o["box"]) > 0.25
+                or _det_overlap(d["box"], o["box"]) > 0.60
+            ):
+                used.add(j)
+        filtered.append(d)
+    return filtered
+
+
+def _det_run_yolo(frame, model_cfgs):
+    dets = []
+    for cfg in model_cfgs:
+        model     = cfg["model"]
+        base_conf = cfg["conf"]
+        cls_conf  = {_det_normalize(k): v for k, v in cfg.get("class_conf", {}).items()}
+        exc       = {_det_normalize(k) for k in cfg.get("exclude", set())}
+        run_conf  = min([base_conf] + list(cls_conf.values()))
+        res = model(frame, conf=run_conf, verbose=False)[0]
+        if res.boxes is None:
+            continue
+        for box in res.boxes:
+            conf = float(box.conf[0])
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            cls_id = int(box.cls[0])
+            raw = model.names.get(cls_id, "object")
+            key = _det_normalize(raw)
+            if key not in _DET_ALLOWED or key in exc:
+                continue
+            mc = _det_match_class(key)
+            b  = (x1, y1, x2, y2)
+            if not _det_valid_shape(mc, b):
+                continue
+            thr = cls_conf.get(key, base_conf)
+            if conf < thr:
+                continue
+            dets.append({
+                "box": b,
+                "center": ((x1 + x2) // 2, (y1 + y2) // 2),
+                "conf": conf,
+                "match_cls": mc,
+            })
+    return _det_filter(dets)
+
+
+def _det_get_intrinsics(frame):
+    matrix = cal_module.calibration_data.get("cameraMatrixR")
+    if matrix is not None and matrix.shape[0] >= 3:
+        return {
+            "fx": float(matrix[0, 0]), "fy": float(matrix[1, 1]),
+            "cx": float(matrix[0, 2]), "cy": float(matrix[1, 2]),
+        }
+    h, w = frame.shape[:2]
+    alpha_rad = math.radians(84)
+    fx = (w * 0.5) / math.tan(alpha_rad / 2)
+    return {"fx": fx, "fy": fx, "cx": w / 2.0, "cy": h / 2.0}
+
+
+def _det_calc_xy(center, depth, intrinsics):
+    u, v = center
+    x = ((u - intrinsics["cx"]) * depth) / intrinsics["fx"]
+    y = ((v - intrinsics["cy"]) * depth) / intrinsics["fy"]
+    return x, y
+
+
+# ================== DÉTECTION MANAGER ============================
+
+class DetectionManager:
+    """
+    Pipeline stéréo YOLO dans un thread de fond.
+    Appelle on_result(match_cls, x_prime_cm, y_prime_cm, z_cm)
+    pour chaque détection stéréo valide.
+    """
+    B          = 7          # baseline caméras en cm
+    F_MM       = 3.6        # focale en mm
+    ALPHA      = 84         # champ de vision horizontal en degrés
+    DIST_SCALE = 90.0 / 50.0
+
+    def __init__(self, on_result):
+        self._on_result = on_result
+        self._stop_evt  = threading.Event()
+        self._thread    = None
+
+    def start(self):
+        self._stop_evt.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop_evt.set()
+
+    def _load_models(self):
+        return [
+            {"model": YOLO(DET_BASE_PATH + "best (2).pt"), "conf": 0.30,
+             "class_conf": {"fardeau": FARDEAU_MIN_CONF, "fardeaux": FARDEAU_MIN_CONF}},
+            {"model": YOLO(DET_BASE_PATH + "best (1).pt"), "conf": 0.50},
+            {"model": YOLO(DET_BASE_PATH + "best (3).pt"), "conf": CONE_MIN_CONF},
+            {"model": YOLO(DET_BASE_PATH + "best (5).pt"), "conf": 0.40},
+            {"model": YOLO("yolov8n.pt"),                  "conf": 0.50},
+        ]
+
+    def _find_match(self, det_r, dets_l):
+        best, best_score = None, float('inf')
+        for dl in dets_l:
+            penalty = 0 if det_r["match_cls"] == dl["match_cls"] else 100
+            xdiff = abs(det_r["center"][0] - dl["center"][0])
+            ydiff = abs(det_r["center"][1] - dl["center"][1])
+            if ydiff > 60 or xdiff > 80:
+                continue
+            score = penalty + ydiff + 0.25 * xdiff
+            if score < best_score:
+                best_score = score
+                best = dl
+        return best
+
+    def _run(self):
+        model_cfgs = self._load_models()
+        cap_r = cv2.VideoCapture(2, cv2.CAP_DSHOW)
+        cap_l = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+        for cap in (cap_r, cap_l):
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        try:
+            while not self._stop_evt.is_set():
+                ok_r, fr = cap_r.read()
+                ok_l, fl = cap_l.read()
+                if not ok_r or not ok_l:
+                    time.sleep(0.05)
+                    continue
+                dets_r     = _det_run_yolo(fr, model_cfgs)
+                dets_l     = _det_run_yolo(fl, model_cfgs)
+                intrinsics = _det_get_intrinsics(fr)
+                for dr in dets_r:
+                    dl = self._find_match(dr, dets_l)
+                    if dl is None:
+                        continue
+                    depth = tri.find_depth(
+                        dr["center"], dl["center"],
+                        fr, fl,
+                        self.B, self.F_MM, self.ALPHA,
+                        self.DIST_SCALE,
+                        intrinsics=intrinsics,
+                    )
+                    if depth == float('inf'):
+                        continue
+                    xc, yc = _det_calc_xy(dr["center"], depth, intrinsics)
+                    xp = 47.5 + yc
+                    yp = 17.5 + xc
+                    self._on_result(dr["match_cls"], xp, yp, depth)
+        finally:
+            cap_r.release()
+            cap_l.release()
 
 
 # ================== SERIAL MANAGER ============================
@@ -782,6 +1023,12 @@ class PontRoulantGUI:
         self.chemin_retour = None   # Liste de waypoints (x,y) ou None
         self.chemin_origine = None  # Liste de waypoints (x,y) ou None — retour origine
 
+        # Détection caméra
+        self._det_histories     = {}   # match_cls -> deque(maxlen=DET_WINDOW)
+        self._det_stable        = {}   # match_cls -> bool
+        self._det_mgr           = None
+        self._mission_triggered = False
+
         self._build_styles()
         self._build_ui()
         self._draw_canvas()
@@ -1234,6 +1481,46 @@ class PontRoulantGUI:
                   style='PanelSubtle.TLabel',
                   font=('Segoe UI', 9, 'italic')).pack(padx=8, pady=(2, 8))
 
+        # Détection Caméra
+        f5 = ttk.LabelFrame(scroll_frame, text="  📷  Détection Caméra  ")
+        f5.pack(fill=tk.X, padx=6, pady=4)
+
+        rb = ttk.Frame(f5, style='Panel.TFrame')
+        rb.pack(fill=tk.X, padx=8, pady=(8, 4))
+        ttk.Button(rb, text="▶  Démarrer Détection",
+                   command=self._start_detection,
+                   style='Success.TButton').pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(rb, text="■  Arrêter",
+                   command=self._stop_detection,
+                   style='Danger.TButton').pack(side=tk.LEFT)
+
+        self._det_fardeau_var    = tk.StringVar(value="—")
+        self._det_truck_var      = tk.StringVar(value="—")
+        self._det_obs_count_var  = tk.StringVar(value="0")
+        self._det_status_var     = tk.StringVar(value="En attente")
+
+        ri = ttk.Frame(f5, style='Panel.TFrame')
+        ri.pack(fill=tk.X, padx=8, pady=2)
+        ttk.Label(ri, text="Fardeau :", width=9).pack(side=tk.LEFT)
+        ttk.Label(ri, textvariable=self._det_fardeau_var,
+                  style='PanelSubtle.TLabel').pack(side=tk.LEFT)
+
+        ri2 = ttk.Frame(f5, style='Panel.TFrame')
+        ri2.pack(fill=tk.X, padx=8, pady=2)
+        ttk.Label(ri2, text="Camion :", width=9).pack(side=tk.LEFT)
+        ttk.Label(ri2, textvariable=self._det_truck_var,
+                  style='PanelSubtle.TLabel').pack(side=tk.LEFT)
+
+        ri3 = ttk.Frame(f5, style='Panel.TFrame')
+        ri3.pack(fill=tk.X, padx=8, pady=2)
+        ttk.Label(ri3, text="Obstacles :", width=9).pack(side=tk.LEFT)
+        ttk.Label(ri3, textvariable=self._det_obs_count_var,
+                  style='PanelSubtle.TLabel').pack(side=tk.LEFT)
+
+        ttk.Label(f5, textvariable=self._det_status_var,
+                  style='PanelSubtle.TLabel',
+                  font=('Segoe UI', 9, 'italic')).pack(padx=8, pady=(2, 8))
+
     # ============ CANVAS ============
 
     def _m2px(self, xm, ym):
@@ -1636,6 +1923,125 @@ class PontRoulantGUI:
                 self.root.after(0, lambda: self.btn_mission.config(state=tk.NORMAL))
         threading.Thread(target=t, daemon=True).start()
 
+    # ============ DÉTECTION CAMÉRA ============
+
+    def _start_detection(self):
+        if self._det_mgr is not None:
+            self.log_msg("⚠ Détection déjà en cours.")
+            return
+        self._mission_triggered = False
+        self._det_histories.clear()
+        self._det_stable.clear()
+        self._det_fardeau_var.set("—")
+        self._det_truck_var.set("—")
+        self._det_obs_count_var.set("0")
+        self._det_status_var.set("Chargement modèles YOLO...")
+
+        def on_result(cls, xp, yp, z):
+            self.root.after(0, self._on_detection_result, cls, xp, yp, z)
+
+        self._det_mgr = DetectionManager(on_result=on_result)
+        self._det_mgr.start()
+        self.log_msg("📷 Détection démarrée (chargement en cours...)")
+
+    def _stop_detection(self):
+        if self._det_mgr:
+            self._det_mgr.stop()
+            self._det_mgr = None
+        self._det_status_var.set("Arrêtée")
+        self.log_msg("📷 Détection arrêtée")
+
+    def _on_detection_result(self, cls, xp, yp, z):
+        # Normaliser les alias de classe
+        cls = {"fardeau": "fardeaux", "mytruck": "truck"}.get(cls, cls)
+        if cls not in self._det_histories:
+            self._det_histories[cls] = deque(maxlen=DET_WINDOW)
+        self._det_histories[cls].append((xp, yp, z))
+        # Indiquer que les modèles sont chargés dès la première détection
+        if self._det_status_var.get() == "Chargement modèles YOLO...":
+            self._det_status_var.set("Détection active")
+        self._check_and_trigger()
+
+    def _check_stability(self, cls):
+        hist = list(self._det_histories.get(cls, []))
+        if len(hist) < DET_MIN_FRAMES:
+            return None
+        arr     = np.array(hist)
+        medians = np.median(arr, axis=0)
+        stds    = np.std(arr, axis=0)
+        if np.all(stds < DET_STD_THRESH):
+            return tuple(medians)  # (xp_cm, yp_cm, z_cm)
+        return None
+
+    def _check_and_trigger(self):
+        fardeau_coords = self._check_stability("fardeaux")
+        truck_coords   = self._check_stability("truck")
+
+        if fardeau_coords:
+            xp, yp, z = fardeau_coords
+            self._det_fardeau_var.set(f"X={xp:.1f}  Y={yp:.1f}  Z={z:.1f} cm  ●")
+        else:
+            n = len(self._det_histories.get("fardeaux", []))
+            self._det_fardeau_var.set(f"({n}/{DET_MIN_FRAMES} frames)  ○")
+
+        if truck_coords:
+            xp, yp, z = truck_coords
+            self._det_truck_var.set(f"X={xp:.1f}  Y={yp:.1f}  Z={z:.1f} cm  ●")
+        else:
+            n = len(self._det_histories.get("truck", []))
+            self._det_truck_var.set(f"({n}/{DET_MIN_FRAMES} frames)  ○")
+
+        if fardeau_coords and truck_coords and not self._mission_triggered:
+            self._mission_triggered = True
+            self._det_status_var.set("Stable ✓ — remplissage automatique")
+            self.log_msg("✓ Détection stable — champs remplis automatiquement")
+
+            def clamp(v, lo, hi):
+                return max(lo, min(hi, v))
+
+            fx = clamp(fardeau_coords[0] / 100, 0.0, WORKSPACE_X)
+            fy = clamp(fardeau_coords[1] / 100, 0.0, WORKSPACE_Y)
+            fz = clamp(fardeau_coords[2] / 100, 0.0, WORKSPACE_Z)
+            lx = clamp(truck_coords[0]   / 100, 0.0, WORKSPACE_X)
+            ly = clamp(truck_coords[1]   / 100, 0.0, WORKSPACE_Y)
+            lz = clamp(truck_coords[2]   / 100, 0.0, WORKSPACE_Z)
+
+            for key, val in [("fx", fx), ("fy", fy), ("fz", fz),
+                              ("lx", lx), ("ly", ly), ("lz", lz)]:
+                self.auto_entries[key].delete(0, tk.END)
+                self.auto_entries[key].insert(0, f"{val:.3f}")
+
+            obs_count = 0
+            for cls in ("cone", "person", "box"):
+                coords = self._check_stability(cls)
+                if coords:
+                    self._add_obs_from_detection(cls, coords[0], coords[1], coords[2])
+                    obs_count += 1
+            self._det_obs_count_var.set(str(obs_count))
+
+            self._draw_canvas()
+            self.root.after(500, self._launch_mission)
+
+    def _add_obs_from_detection(self, cls, xp_cm, yp_cm, z_cm):
+        l, w = OBS_DEFAULT_SIZE.get(cls, (0.10, 0.10))
+        cx = xp_cm / 100
+        cy = yp_cm / 100
+        obs = {
+            'x':     max(0.0, cx - l / 2),
+            'y':     max(0.0, cy - w / 2),
+            'l':     l,
+            'w':     w,
+            'z_min': 0.0,
+            'z_max': min(WORKSPACE_Z, z_cm / 100),
+        }
+        self.obstacles.append(obs)
+        self.obs_list.insert(tk.END,
+            f"[DET:{cls}] ({obs['x']:.2f},{obs['y']:.2f}) "
+            f"{obs['l']:.2f}×{obs['w']:.2f} Z:[0.00-{obs['z_max']:.2f}]")
+        self.chemin_aller   = None
+        self.chemin_retour  = None
+        self.chemin_origine = None
+
     # ============ LOG ============
 
     def log_msg(self, msg):
@@ -1655,4 +2061,10 @@ if __name__ == "__main__":
     root.geometry(f"{CANVAS_W + 390}x{CANVAS_H + 280}")
     root.minsize(1000, 700)
     app = PontRoulantGUI(root)
+
+    def on_closing():
+        app._stop_detection()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_closing)
     root.mainloop()
